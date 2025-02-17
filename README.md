@@ -42,3 +42,6 @@ The output should be similar to:
 ```
 touch-2502    [007] ....1   161.355842: bpf_trace_printk: Blocked file creation in /etc/test: file
 ```
+
+### License
+This project is licensed under GPL-2.0.
