@@ -6,74 +6,86 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
-// Error code returned when an operation is prohibited (EPERM - Operation not permitted).
 #define EPERM 1
-
-// Maximum length of file or directory name used for buffers.
 #define MAX_NAME_LEN 64
 
 /**
-* @brief eBPF program that uses the inode_create LSM hook to block
-* file creation in a specific directory (/etc/test).
-*
-* @param dir Pointer to the inode of the parent directory where the file is being created.
-* @param dentry Pointer to a dentry structure representing the file being created.
-* @param mode Access rights of the file being created.
-*
-* @return 0 if the operation is allowed, -EPERM if file creation is prohibited.
-*
-* This eBPF hook is executed when an attempt is made to create a new file in the file system.
-* It checks if the file is in the prohibited `/etc/test` directory,
-* and if so, prevents its creation.
-*/
+ * Здесь указываем, какой путь «разрешить»: /etc/test
+ * Если хотите другой путь (две компоненты),
+ * например /var/log, то задайте:
+ *   #define ALLOWED_PARENT "var"
+ *   #define ALLOWED_CHILD  "log"
+ */
+#define ALLOWED_PARENT "etc"
+#define ALLOWED_CHILD  "test"
+
+/**
+ * Простейшая функция сравнения строк (до MAX_NAME_LEN).
+ * Возвращает true, если совпадают, иначе false.
+ */
+static __inline bool name_equals(const char *name, const char *pattern) {
+#pragma clang loop unroll(disable)
+    for (int i = 0; i < MAX_NAME_LEN; i++) {
+        if (name[i] != pattern[i])
+            return false;
+        if (name[i] == '\0')
+            return true;  
+    }
+    return false;
+}
+
+/**
+ * Хук LSM: inode_create — срабатывает при создании нового файла/каталога.
+ * Блокируем всё, кроме /etc/test (или вашего пути, заданного выше).
+ */
 SEC("lsm/inode_create")
-int BPF_PROG(block_file_create, struct inode *dir, struct dentry *dentry, umode_t mode) {
-    
-    // Buffers for storing the names of the file being created and its parent directory.
-    char name[MAX_NAME_LEN];
-    char parent_name[MAX_NAME_LEN];
+int BPF_PROG(block_all_except_my_path,
+             struct inode *dir, struct dentry *dentry, umode_t mode)
+{
+    // начинаем с dentry вновь создаваемого объекта
+    struct dentry *current = dentry;
 
-    // Extract the name of the file being created from the dentry structure.
-    struct qstr d_name = BPF_CORE_READ(dentry, d_name);
-    struct dentry *parent = BPF_CORE_READ(dentry, d_parent);
+#pragma unroll
+    for (int depth = 0; depth < 20; depth++) {
+        if (!current)
+            break;
 
-    // Read the name of the file being created into the name variable.
-    bpf_probe_read_kernel_str(name, sizeof(name), d_name.name);
+        // Считываем имя текущего dentry
+        char current_name[MAX_NAME_LEN] = {};
+        bpf_probe_read_kernel_str(current_name, sizeof(current_name),
+                                  BPF_CORE_READ(current, d_name.name));
 
-    // Read the name of the parent directory in which the file is created.
-    bpf_probe_read_kernel_str(parent_name, sizeof(parent_name), BPF_CORE_READ(parent, d_name.name));
+        // Шаг 1: проверяем, совпадает ли имя с ALLOWED_CHILD ("test")
+        if (name_equals(current_name, ALLOWED_CHILD)) {
+            // Берём родитель
+            struct dentry *parent = BPF_CORE_READ(current, d_parent);
+            if (!parent)
+                break;
 
-    /**
-    * Check if a file is created in the "test" directory.
-    * The directory name is checked character by character, since eBPF does not allow
-    * to use standard string functions from <string.h>.
-    */
-    if (parent_name[0] == 't' && parent_name[1] == 'e' &&
-        parent_name[2] == 's' && parent_name[3] == 't' && parent_name[4] == '\0') {
-        
-        // Get a pointer to the parent directory (grandparent), that is /etc/
-        struct dentry *grandparent = BPF_CORE_READ(parent, d_parent);
-        char grandparent_name[MAX_NAME_LEN];
+            // Считываем имя родителя
+            char parent_name[MAX_NAME_LEN] = {};
+            bpf_probe_read_kernel_str(parent_name, sizeof(parent_name),
+                                      BPF_CORE_READ(parent, d_name.name));
 
-        // Read parent name dir into grandparent_name variable
-        bpf_probe_read_kernel_str(grandparent_name, sizeof(grandparent_name), BPF_CORE_READ(grandparent, d_name.name));
-
-        /**
-        * Check if grandparent is "/etc/".
-        * If the parent directory is "test" and its parent is "etc",
-        * then the file path is "/etc/test/".
-        */
-        if (grandparent_name[0] == 'e' && grandparent_name[1] == 't' &&
-            grandparent_name[2] == 'c' && grandparent_name[3] == '\0') {
-
-            // Output the message to bpf_printk (can be viewed via trace_pipe).
-            bpf_printk("Blocked file creation in /etc/test: %s\n", name);
-
-            // Block file creation and returning "Operation not permitted" error.
-            return -EPERM;
+            // Шаг 2: имя родителя должно быть ALLOWED_PARENT ("etc")
+            if (name_equals(parent_name, ALLOWED_PARENT)) {
+                // Шаг 3: проверяем, что это находится непосредственно под корнем.
+                // Обычно корень узнаётся по parent->d_parent == parent (сам на себя)
+                struct dentry *grandp = BPF_CORE_READ(parent, d_parent);
+                if (grandp) {
+                    struct dentry *ggp = BPF_CORE_READ(grandp, d_parent);
+                    if (ggp == grandp) {
+                        // Значит, это /etc/test => разрешаем создание
+                        return 0;
+                    }
+                }
+            }
         }
+
+        // Переходим выше по дереву
+        current = BPF_CORE_READ(current, d_parent);
     }
 
-    // Allow the operation if the path does not match the forbidden one.
-    return 0;
+    // Если вышли из цикла — значит, наш путь не совпал => блокируем
+    return -EPERM;
 }
